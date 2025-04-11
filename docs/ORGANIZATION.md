@@ -1,2 +1,2 @@
-# Servo’s directory structure
+# Swervo’s directory structure
 
