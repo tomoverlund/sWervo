@@ -5,13 +5,14 @@
 //! This module implements structured cloning, as defined by [HTML](https://html.spec.whatwg.org/multipage/#safe-passing-of-structured-data).
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::os::raw;
 use std::ptr;
 
-use base::id::{BlobId, DomPointId, MessagePortId, PipelineNamespaceId};
+use base::id::{BlobId, DomExceptionId, DomPointId, MessagePortId, PipelineNamespaceId};
 use constellation_traits::{
-    BlobImpl, DomPoint, MessagePortImpl, Serializable as SerializableInterface,
+    BlobImpl, DomException, DomPoint, MessagePortImpl, Serializable as SerializableInterface,
     StructuredSerializedData, Transferrable as TransferrableInterface,
 };
 use js::glue::{
@@ -40,6 +41,9 @@ use crate::dom::dompoint::DOMPoint;
 use crate::dom::dompointreadonly::DOMPointReadOnly;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
+use crate::dom::readablestream::ReadableStream;
+use crate::dom::types::DOMException;
+use crate::dom::writablestream::WritableStream;
 use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
@@ -56,6 +60,9 @@ pub(super) enum StructuredCloneTags {
     Principals = 0xFFFF8003,
     DomPointReadOnly = 0xFFFF8004,
     DomPoint = 0xFFFF8005,
+    ReadableStream = 0xFFFF8006,
+    DomException = 0xFFFF8007,
+    WritableStream = 0xFFFF8008,
     Max = 0xFFFFFFFF,
 }
 
@@ -65,6 +72,7 @@ impl From<SerializableInterface> for StructuredCloneTags {
             SerializableInterface::Blob => StructuredCloneTags::DomBlob,
             SerializableInterface::DomPointReadOnly => StructuredCloneTags::DomPointReadOnly,
             SerializableInterface::DomPoint => StructuredCloneTags::DomPoint,
+            SerializableInterface::DomException => StructuredCloneTags::DomException,
         }
     }
 }
@@ -73,6 +81,8 @@ impl From<TransferrableInterface> for StructuredCloneTags {
     fn from(v: TransferrableInterface) -> Self {
         match v {
             TransferrableInterface::MessagePort => StructuredCloneTags::MessagePort,
+            TransferrableInterface::ReadableStream => StructuredCloneTags::ReadableStream,
+            TransferrableInterface::WritableStream => StructuredCloneTags::WritableStream,
         }
     }
 }
@@ -89,6 +99,7 @@ fn reader_for_type(
         SerializableInterface::Blob => read_object::<Blob>,
         SerializableInterface::DomPointReadOnly => read_object::<DOMPointReadOnly>,
         SerializableInterface::DomPoint => read_object::<DOMPoint>,
+        SerializableInterface::DomException => read_object::<DOMException>,
     }
 }
 
@@ -222,6 +233,7 @@ fn serialize_for_type(val: SerializableInterface) -> SerializeOperation {
         SerializableInterface::Blob => try_serialize::<Blob>,
         SerializableInterface::DomPointReadOnly => try_serialize::<DOMPointReadOnly>,
         SerializableInterface::DomPoint => try_serialize::<DOMPoint>,
+        SerializableInterface::DomException => try_serialize::<DOMException>,
     }
 }
 
@@ -249,6 +261,8 @@ fn receiver_for_type(
 ) -> fn(&GlobalScope, &mut StructuredDataReader, u64, RawMutableHandleObject) -> Result<(), ()> {
     match val {
         TransferrableInterface::MessagePort => receive_object::<MessagePort>,
+        TransferrableInterface::ReadableStream => receive_object::<ReadableStream>,
+        TransferrableInterface::WritableStream => receive_object::<WritableStream>,
     }
 }
 
@@ -312,6 +326,7 @@ unsafe extern "C" fn read_transfer_callback(
     let sc_reader = &mut *(closure as *mut StructuredDataReader);
     let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
     let owner = GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof));
+
     for transferrable in TransferrableInterface::iter() {
         if tag == StructuredCloneTags::from(transferrable) as u32 {
             let transfer_receiver = receiver_for_type(transferrable);
@@ -373,6 +388,8 @@ type TransferOperation = unsafe fn(
 fn transfer_for_type(val: TransferrableInterface) -> TransferOperation {
     match val {
         TransferrableInterface::MessagePort => try_transfer::<MessagePort>,
+        TransferrableInterface::ReadableStream => try_transfer::<ReadableStream>,
+        TransferrableInterface::WritableStream => try_transfer::<WritableStream>,
     }
 }
 
@@ -419,6 +436,8 @@ unsafe fn can_transfer_for_type(
     }
     match transferable {
         TransferrableInterface::MessagePort => can_transfer::<MessagePort>(obj, cx),
+        TransferrableInterface::ReadableStream => can_transfer::<ReadableStream>(obj, cx),
+        TransferrableInterface::WritableStream => can_transfer::<WritableStream>(obj, cx),
     }
 }
 
@@ -439,9 +458,16 @@ unsafe extern "C" fn can_transfer_callback(
 unsafe extern "C" fn report_error_callback(
     _cx: *mut JSContext,
     _errorid: u32,
-    _closure: *mut ::std::os::raw::c_void,
-    _error_message: *const ::std::os::raw::c_char,
+    closure: *mut raw::c_void,
+    error_message: *const ::std::os::raw::c_char,
 ) {
+    let msg_result = unsafe { CStr::from_ptr(error_message).to_str().map(str::to_string) };
+
+    if let Ok(msg) = msg_result {
+        let dom_error_record = &mut *(closure as *mut DOMErrorRecord);
+
+        dom_error_record.message = Some(msg)
+    }
 }
 
 unsafe extern "C" fn sab_cloned_callback(
@@ -468,14 +494,25 @@ pub(crate) enum StructuredData<'a> {
     Writer(&'a mut StructuredDataWriter),
 }
 
+#[derive(Default)]
+#[repr(C)]
+pub(crate) struct DOMErrorRecord {
+    pub(crate) message: Option<String>,
+}
+
 /// Reader and writer structs for results from, and inputs to, structured-data read/write operations.
 /// <https://html.spec.whatwg.org/multipage/#safe-passing-of-structured-data>
+#[repr(C)]
 pub(crate) struct StructuredDataReader {
+    /// A struct of error message.
+    pub(crate) errors: DOMErrorRecord,
     /// A map of deserialized blobs, stored temporarily here to keep them rooted.
     pub(crate) blobs: Option<HashMap<StorageKey, DomRoot<Blob>>>,
     /// A map of deserialized points, stored temporarily here to keep them rooted.
     pub(crate) points_read_only: Option<HashMap<StorageKey, DomRoot<DOMPointReadOnly>>>,
     pub(crate) dom_points: Option<HashMap<StorageKey, DomRoot<DOMPoint>>>,
+    /// A map of deserialized exceptions, stored temporarily here to keep them rooted.
+    pub(crate) dom_exceptions: Option<HashMap<StorageKey, DomRoot<DOMException>>>,
     /// A vec of transfer-received DOM ports,
     /// to be made available to script through a message event.
     pub(crate) message_ports: Option<Vec<DomRoot<MessagePort>>>,
@@ -489,15 +526,28 @@ pub(crate) struct StructuredDataReader {
     pub(crate) blob_impls: Option<HashMap<BlobId, BlobImpl>>,
     /// A map of serialized points.
     pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    /// A map of serialized exceptions.
+    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
+
+    /// <https://streams.spec.whatwg.org/#rs-transfer>
+    pub(crate) readable_streams: Option<Vec<DomRoot<ReadableStream>>>,
+
+    /// <https://streams.spec.whatwg.org/#ws-transfer>
+    pub(crate) writable_streams: Option<Vec<DomRoot<WritableStream>>>,
 }
 
 /// A data holder for transferred and serialized objects.
 #[derive(Default)]
+#[repr(C)]
 pub(crate) struct StructuredDataWriter {
+    /// Error message.
+    pub(crate) errors: DOMErrorRecord,
     /// Transferred ports.
     pub(crate) ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
     /// Serialized points.
     pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    /// Serialized exceptions.
+    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
     /// Serialized blobs.
     pub(crate) blobs: Option<HashMap<BlobId, BlobImpl>>,
 }
@@ -537,7 +587,7 @@ pub(crate) fn write(
         );
         if !result {
             JS_ClearPendingException(*cx);
-            return Err(Error::DataClone);
+            return Err(Error::DataClone(sc_writer.errors.message));
         }
 
         let nbytes = GetLengthOfJSStructuredCloneData(scdata);
@@ -551,6 +601,7 @@ pub(crate) fn write(
             serialized: data,
             ports: sc_writer.ports.take(),
             points: sc_writer.points.take(),
+            exceptions: sc_writer.exceptions.take(),
             blobs: sc_writer.blobs.take(),
         };
 
@@ -572,9 +623,14 @@ pub(crate) fn read(
         message_ports: None,
         points_read_only: None,
         dom_points: None,
+        dom_exceptions: None,
         port_impls: data.ports.take(),
         blob_impls: data.blobs.take(),
         points: data.points.take(),
+        exceptions: data.exceptions.take(),
+        errors: DOMErrorRecord { message: None },
+        readable_streams: None,
+        writable_streams: None,
     };
     let sc_reader_ptr = &mut sc_reader as *mut _;
     unsafe {
@@ -605,14 +661,13 @@ pub(crate) fn read(
         );
         if !result {
             JS_ClearPendingException(*cx);
-            return Err(Error::DataClone);
+            return Err(Error::DataClone(sc_reader.errors.message));
         }
 
         DeleteJSAutoStructuredCloneBuffer(scbuf);
 
         // Any transfer-received port-impls should have been taken out.
         assert!(sc_reader.port_impls.is_none());
-
         Ok(sc_reader.message_ports.take().unwrap_or_default())
     }
 }

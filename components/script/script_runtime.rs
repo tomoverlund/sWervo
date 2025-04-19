@@ -8,8 +8,7 @@
 #![allow(dead_code)]
 
 use core::ffi::c_char;
-use std::cell::{Cell, LazyCell, RefCell};
-use std::collections::HashSet;
+use std::cell::Cell;
 use std::ffi::CString;
 use std::io::{Write, stdout};
 use std::ops::Deref;
@@ -83,7 +82,7 @@ use crate::microtask::{EnqueuedPromiseCallback, Microtask, MicrotaskQueue};
 use crate::realms::{AlreadyInRealm, InRealm};
 use crate::script_module::EnsureModuleHooksInitialized;
 use crate::script_thread::trace_thread;
-use crate::security_manager::CSPViolationReporter;
+use crate::security_manager::{CSPViolationReportBuilder, CSPViolationReportTask};
 use crate::task_source::SendableTaskSource;
 
 static JOB_QUEUE_TRAPS: JobQueueTraps = JobQueueTraps {
@@ -390,6 +389,11 @@ unsafe extern "C" fn content_security_policy_allows(
             csp_list.is_wasm_evaluation_allowed() == CheckResult::Allowed;
         let scripted_caller = describe_scripted_caller(*cx).unwrap_or_default();
 
+        let resource = match runtime_code {
+            RuntimeCode::JS => "eval".to_owned(),
+            RuntimeCode::WASM => "wasm-eval".to_owned(),
+        };
+
         allowed = match runtime_code {
             RuntimeCode::JS if is_js_evaluation_allowed => true,
             RuntimeCode::WASM if is_wasm_evaluation_allowed => true,
@@ -400,15 +404,17 @@ unsafe extern "C" fn content_security_policy_allows(
             // FIXME: Don't fire event if `script-src` and `default-src`
             // were not passed.
             for policy in csp_list.0 {
-                let task = CSPViolationReporter::new(
-                    &global,
-                    sample.clone(),
-                    policy.disposition == PolicyDisposition::Report,
-                    runtime_code,
-                    scripted_caller.filename.clone(),
-                    scripted_caller.line,
-                    scripted_caller.col,
-                );
+                let report = CSPViolationReportBuilder::default()
+                    .resource(resource.clone())
+                    .sample(sample.clone())
+                    .report_only(policy.disposition == PolicyDisposition::Report)
+                    .source_file(scripted_caller.filename.clone())
+                    .line_number(scripted_caller.line)
+                    .column_number(scripted_caller.col)
+                    .effective_directive("script-src".to_owned())
+                    .build(&global);
+                let task = CSPViolationReportTask::new(&global, report);
+
                 global
                     .task_manager()
                     .dom_manipulation_task_source()
@@ -811,9 +817,7 @@ fn in_range<T: PartialOrd + Copy>(val: T, min: T, max: T) -> Option<T> {
     }
 }
 
-thread_local!(static SEEN_POINTERS: LazyCell<RefCell<HashSet<*const c_void>>> = const {
-    LazyCell::new(|| RefCell::new(HashSet::new()))
-});
+thread_local!(static MALLOC_SIZE_OF_OPS: Cell<*mut MallocSizeOfOps> = const { Cell::new(ptr::null_mut()) });
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn get_size(obj: *mut JSObject) -> usize {
@@ -824,14 +828,8 @@ unsafe extern "C" fn get_size(obj: *mut JSObject) -> usize {
             if dom_object.is_null() {
                 return 0;
             }
-            let seen_pointer =
-                move |ptr| SEEN_POINTERS.with(|pointers| !pointers.borrow_mut().insert(ptr));
-            let mut ops = MallocSizeOfOps::new(
-                servo_allocator::usable_size,
-                None,
-                Some(Box::new(seen_pointer)),
-            );
-            (v.malloc_size_of)(&mut ops, dom_object)
+            let ops = MALLOC_SIZE_OF_OPS.get();
+            (v.malloc_size_of)(&mut *ops, dom_object)
         },
         Err(_e) => 0,
     }
@@ -936,13 +934,13 @@ pub(crate) use script_bindings::script_runtime::JSContext;
 /// Extra methods for the JSContext type defined in script_bindings, when
 /// the methods are only called by code in the script crate.
 pub(crate) trait JSContextHelper {
-    fn get_reports(&self, path_seg: String) -> Vec<Report>;
+    fn get_reports(&self, path_seg: String, ops: &mut MallocSizeOfOps) -> Vec<Report>;
 }
 
 impl JSContextHelper for JSContext {
     #[allow(unsafe_code)]
-    fn get_reports(&self, path_seg: String) -> Vec<Report> {
-        SEEN_POINTERS.with(|pointers| pointers.borrow_mut().clear());
+    fn get_reports(&self, path_seg: String, ops: &mut MallocSizeOfOps) -> Vec<Report> {
+        MALLOC_SIZE_OF_OPS.with(|ops_tls| ops_tls.set(ops));
         let stats = unsafe {
             let mut stats = ::std::mem::zeroed();
             if !CollectServoSizes(**self, &mut stats, Some(get_size)) {
@@ -950,6 +948,7 @@ impl JSContextHelper for JSContext {
             }
             stats
         };
+        MALLOC_SIZE_OF_OPS.with(|ops| ops.set(ptr::null_mut()));
 
         let mut reports = vec![];
         let mut report = |mut path_suffix, kind, size| {

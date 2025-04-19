@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
+use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc;
 use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
@@ -27,13 +28,13 @@ use crate::{
 };
 
 /// <https://drafts.csswg.org/css-display/#independent-formatting-context>
-#[derive(Debug)]
+#[derive(Debug, MallocSizeOf)]
 pub(crate) struct IndependentFormattingContext {
     pub base: LayoutBoxBase,
     pub contents: IndependentFormattingContextContents,
 }
 
-#[derive(Debug)]
+#[derive(Debug, MallocSizeOf)]
 pub(crate) enum IndependentFormattingContextContents {
     NonReplaced(IndependentNonReplacedContents),
     Replaced(ReplacedContents),
@@ -41,7 +42,7 @@ pub(crate) enum IndependentFormattingContextContents {
 
 // Private so that code outside of this module cannot match variants.
 // It should got through methods instead.
-#[derive(Debug)]
+#[derive(Debug, MallocSizeOf)]
 pub(crate) enum IndependentNonReplacedContents {
     Flow(BlockFormattingContext),
     Flex(FlexContainer),
@@ -52,7 +53,7 @@ pub(crate) enum IndependentNonReplacedContents {
 
 /// The baselines of a layout or a [`crate::fragment_tree::BoxFragment`]. Some layout
 /// uses the first and some layout uses the last.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, MallocSizeOf)]
 pub(crate) struct Baselines {
     pub first: Option<Au>,
     pub last: Option<Au>,
@@ -275,6 +276,7 @@ impl IndependentNonReplacedContents {
         depends_on_block_constraints: bool,
     ) -> CacheableLayoutResult {
         if let Some(cache) = base.cached_layout_result.borrow().as_ref() {
+            let cache = &**cache;
             if cache.containing_block_for_children_size.inline ==
                 containing_block_for_children.size.inline &&
                 (cache.containing_block_for_children_size.block ==
@@ -305,11 +307,11 @@ impl IndependentNonReplacedContents {
             depends_on_block_constraints,
         );
 
-        *base.cached_layout_result.borrow_mut() = Some(CacheableLayoutResultAndInputs {
+        *base.cached_layout_result.borrow_mut() = Some(Box::new(CacheableLayoutResultAndInputs {
             result: result.clone(),
             positioning_context: child_positioning_context.clone(),
             containing_block_for_children_size: containing_block_for_children.size.clone(),
-        });
+        }));
         positioning_context.append(child_positioning_context);
 
         result

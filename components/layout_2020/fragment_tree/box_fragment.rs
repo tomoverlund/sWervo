@@ -5,6 +5,7 @@
 use app_units::Au;
 use atomic_refcell::AtomicRefCell;
 use base::print_tree::PrintTree;
+use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
 use style::Zero;
 use style::computed_values::border_collapse::T as BorderCollapse;
@@ -24,6 +25,7 @@ use crate::table::SpecificTableGridInfo;
 use crate::taffy::SpecificTaffyGridInfo;
 
 /// Describes how a [`BoxFragment`] paints its background.
+#[derive(MallocSizeOf)]
 pub(crate) enum BackgroundMode {
     /// Draw the normal [`BoxFragment`] background as well as the extra backgrounds
     /// based on the style and positioning rectangles in this data structure.
@@ -36,12 +38,14 @@ pub(crate) enum BackgroundMode {
     Normal,
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct ExtraBackground {
+    #[conditional_malloc_size_of]
     pub style: ServoArc<ComputedValues>,
     pub rect: PhysicalRect<Au>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub(crate) enum SpecificLayoutInfo {
     Grid(Box<SpecificTaffyGridInfo>),
     TableCellWithCollapsedBorders,
@@ -49,9 +53,11 @@ pub(crate) enum SpecificLayoutInfo {
     TableWrapper,
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct BoxFragment {
     pub base: BaseFragment,
 
+    #[conditional_malloc_size_of]
     pub style: ServoArc<ComputedValues>,
     pub children: Vec<Fragment>,
 
@@ -76,7 +82,7 @@ pub(crate) struct BoxFragment {
     /// to things such as tables and inline formatting contexts.
     baselines: Baselines,
 
-    pub block_margins_collapsed_with_children: CollapsedBlockMargins,
+    block_margins_collapsed_with_children: Option<Box<CollapsedBlockMargins>>,
 
     /// The scrollable overflow of this box fragment.
     pub scrollable_overflow_from_children: PhysicalRect<Au>,
@@ -103,7 +109,6 @@ impl BoxFragment {
         border: PhysicalSides<Au>,
         margin: PhysicalSides<Au>,
         clearance: Option<Au>,
-        block_margins_collapsed_with_children: CollapsedBlockMargins,
     ) -> BoxFragment {
         let scrollable_overflow_from_children =
             children.iter().fold(PhysicalRect::zero(), |acc, child| {
@@ -120,7 +125,7 @@ impl BoxFragment {
             margin,
             clearance,
             baselines: Baselines::default(),
-            block_margins_collapsed_with_children,
+            block_margins_collapsed_with_children: None,
             scrollable_overflow_from_children,
             resolved_sticky_insets: AtomicRefCell::default(),
             background_mode: BackgroundMode::Normal,
@@ -179,6 +184,14 @@ impl BoxFragment {
 
     pub fn with_specific_layout_info(mut self, info: Option<SpecificLayoutInfo>) -> Self {
         self.specific_layout_info = info;
+        self
+    }
+
+    pub fn with_block_margins_collapsed_with_children(
+        mut self,
+        collapsed_margins: CollapsedBlockMargins,
+    ) -> Self {
+        self.block_margins_collapsed_with_children = Some(collapsed_margins.into());
         self
     }
 
@@ -372,6 +385,13 @@ impl BoxFragment {
                 self.style.get_inherited_table().border_collapse == BorderCollapse::Collapse
             },
             _ => false,
+        }
+    }
+
+    pub(crate) fn block_margins_collapsed_with_children(&self) -> CollapsedBlockMargins {
+        match self.block_margins_collapsed_with_children.as_ref() {
+            Some(collapsed_block_margins) => *(collapsed_block_margins).clone(),
+            _ => CollapsedBlockMargins::zero(),
         }
     }
 }

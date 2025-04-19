@@ -214,7 +214,7 @@ impl FlexLineItem<'_> {
         flex_context: &mut FlexContext,
         all_baselines: &mut Baselines,
         main_position_cursor: &mut Au,
-    ) -> (BoxFragment, PositioningContext) {
+    ) -> (ArcRefCell<BoxFragment>, PositioningContext) {
         // https://drafts.csswg.org/css-flexbox/#algo-main-align
         // “Align the items along the main-axis”
         *main_position_cursor +=
@@ -256,8 +256,6 @@ impl FlexLineItem<'_> {
                 size: item_used_size,
             },
         );
-        let margin = flex_context.sides_to_flow_relative(item_margin);
-        let collapsed_margin = CollapsedBlockMargins::from_margin(&margin);
 
         if let Some(item_baseline) = self.layout_result.baseline_relative_to_margin_box.as_ref() {
             let item_baseline = *item_baseline + item_content_cross_start_position -
@@ -294,9 +292,10 @@ impl FlexLineItem<'_> {
             flex_context
                 .sides_to_flow_relative(self.item.border)
                 .to_physical(container_writing_mode),
-            margin.to_physical(container_writing_mode),
+            flex_context
+                .sides_to_flow_relative(item_margin)
+                .to_physical(container_writing_mode),
             None, /* clearance */
-            collapsed_margin,
         );
 
         // If this flex item establishes a containing block for absolutely-positioned
@@ -313,6 +312,12 @@ impl FlexLineItem<'_> {
                 .to_physical_size(containing_block.style.writing_mode)
         }
 
+        let fragment = ArcRefCell::new(fragment);
+        self.item
+            .box_
+            .independent_formatting_context
+            .base
+            .set_fragment(Fragment::Box(fragment.clone()));
         (fragment, self.layout_result.positioning_context)
     }
 }
@@ -324,7 +329,7 @@ struct FinalFlexLineLayout {
     cross_size: Au,
     /// The [`BoxFragment`]s and [`PositioningContext`]s of all flex items,
     /// one per flex item in "order-modified document order."
-    item_fragments: Vec<(BoxFragment, PositioningContext)>,
+    item_fragments: Vec<(ArcRefCell<BoxFragment>, PositioningContext)>,
     /// The 'shared alignment baseline' of this flex line. This is the baseline used for
     /// baseline-aligned items if there are any, otherwise `None`.
     shared_alignment_baseline: Option<Au>,
@@ -936,7 +941,7 @@ impl FlexContainer {
                 let physical_line_position =
                     flow_relative_line_position.to_physical_size(self.style.writing_mode);
                 for (fragment, _) in &mut final_line_layout.item_fragments {
-                    fragment.content_rect.origin += physical_line_position;
+                    fragment.borrow_mut().content_rect.origin += physical_line_position;
                 }
                 final_line_layout.item_fragments
             })
@@ -958,7 +963,7 @@ impl FlexContainer {
                     // per flex item, in the original order.
                     let (fragment, mut child_positioning_context) =
                         flex_item_fragments.next().unwrap();
-                    let fragment = Fragment::Box(ArcRefCell::new(fragment));
+                    let fragment = Fragment::Box(fragment);
                     child_positioning_context.adjust_static_position_of_hoisted_fragments(
                         &fragment,
                         PositioningContextLength::zero(),
@@ -2156,10 +2161,7 @@ impl FlexItem<'_> {
 
     #[inline]
     fn is_table(&self) -> bool {
-        match &self.box_.independent_formatting_context.contents {
-            IndependentFormattingContextContents::NonReplaced(content) => content.is_table(),
-            IndependentFormattingContextContents::Replaced(_) => false,
-        }
+        self.box_.is_table()
     }
 }
 
@@ -2367,6 +2369,7 @@ impl FlexItemBox {
             get_automatic_minimum_size,
             stretch_size.main,
             &main_content_sizes,
+            self.is_table(),
         );
 
         FlexItem {
@@ -2723,6 +2726,14 @@ impl FlexItemBox {
                     IntrinsicSizingMode::Size => content_block_size(),
                 }
             },
+        }
+    }
+
+    #[inline]
+    fn is_table(&self) -> bool {
+        match &self.independent_formatting_context.contents {
+            IndependentFormattingContextContents::NonReplaced(content) => content.is_table(),
+            IndependentFormattingContextContents::Replaced(_) => false,
         }
     }
 }

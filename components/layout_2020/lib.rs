@@ -29,8 +29,10 @@ pub mod table;
 pub mod traversal;
 
 use app_units::Au;
+pub use cell::ArcRefCell;
 pub use flow::BoxTree;
 pub use fragment_tree::FragmentTree;
+use malloc_size_of_derive::MallocSizeOf;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::values::computed::TextDecorationLine;
@@ -112,7 +114,7 @@ impl<'a> From<&'_ DefiniteContainingBlock<'a>> for IndefiniteContainingBlock {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub(crate) struct ContainingBlockSize {
     inline: Au,
     block: SizeConstraint,

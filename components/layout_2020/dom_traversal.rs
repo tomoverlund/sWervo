@@ -211,18 +211,19 @@ fn traverse_children_of<'dom, Node>(
 
     if is_text_input_element || is_textarea_element {
         let info = NodeAndStyleInfo::new(parent_element, parent_element.style(context));
-
-        if is_text_input_element {
+        let node_text_content = parent_element.to_threadsafe().node_text_content();
+        if node_text_content.is_empty() {
             // The addition of zero-width space here forces the text input to have an inline formatting
             // context that might otherwise be trimmed if there's no text. This is important to ensure
             // that the input element is at least as tall as the line gap of the caret:
             // <https://drafts.csswg.org/css-ui/#element-with-default-preferred-size>.
             //
+            // This is also used to ensure that the caret will still be rendered when the input is empty.
             // TODO: Is there a less hacky way to do this?
             handler.handle_text(&info, "\u{200B}".into());
+        } else {
+            handler.handle_text(&info, node_text_content);
         }
-
-        handler.handle_text(&info, parent_element.to_threadsafe().node_text_content());
     }
 
     if !is_text_input_element && !is_textarea_element {

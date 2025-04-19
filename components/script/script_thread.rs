@@ -41,20 +41,24 @@ use constellation_traits::{
     JsEvalResult, LoadData, LoadOrigin, NavigationHistoryBehavior, ScriptToConstellationChan,
     ScriptToConstellationMessage, ScrollState, StructuredSerializedData, WindowSizeType,
 };
+use content_security_policy::{self as csp};
 use crossbeam_channel::unbounded;
+use data_url::mime::Mime;
 use devtools_traits::{
     CSSError, DevtoolScriptControlMsg, DevtoolsPageInfo, NavigationState,
     ScriptToDevtoolsControlMsg, WorkerId,
 };
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    CompositorHitTestResult, EmbedderMsg, InputEvent, MediaSessionActionType, Theme,
-    ViewportDetails, WebDriverScriptCommand,
+    CompositorHitTestResult, EmbedderMsg, InputEvent, MediaSessionActionType, MouseButton,
+    MouseButtonAction, MouseButtonEvent, Theme, ViewportDetails, WebDriverScriptCommand,
 };
+use euclid::Point2D;
 use euclid::default::Rect;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
 use html5ever::{local_name, namespace_url, ns};
+use http::header::REFRESH;
 use hyper_serde::Serde;
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
@@ -66,7 +70,6 @@ use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
-use mime::{self, Mime};
 use net_traits::image_cache::{ImageCache, PendingImageResponse};
 use net_traits::request::{Referrer, RequestId};
 use net_traits::response::ResponseInit;
@@ -76,7 +79,7 @@ use net_traits::{
     ResourceFetchTiming, ResourceThreads, ResourceTimingType,
 };
 use percent_encoding::percent_decode;
-use profile_traits::mem::{ProcessReports, ReportsChan};
+use profile_traits::mem::{ProcessReports, ReportsChan, perform_memory_report};
 use profile_traits::time::ProfilerCategory;
 use profile_traits::time_profile;
 use script_layout_interface::{
@@ -96,6 +99,7 @@ use url::Position;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPUDevice, WebGPUMsg};
 use webrender_api::DocumentId;
+use webrender_api::units::DevicePixel;
 
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
@@ -143,6 +147,7 @@ use crate::messaging::{
     ScriptThreadReceivers, ScriptThreadSenders,
 };
 use crate::microtask::{Microtask, MicrotaskQueue};
+use crate::mime::{APPLICATION, MimeExt, TEXT, XML};
 use crate::navigation::{InProgressLoad, NavigationListener};
 use crate::realms::enter_realm;
 use crate::script_module::ScriptFetchOptions;
@@ -330,6 +335,16 @@ pub struct ScriptThread {
     /// A factory for making new layouts. This allows layout to depend on script.
     #[no_trace]
     layout_factory: Arc<dyn LayoutFactory>,
+
+    // Mouse down button: TO BE REMOVED. Not needed as click event should only
+    // triggered for primary button
+    #[no_trace]
+    mouse_down_button: Cell<Option<MouseButton>>,
+
+    // Mouse down point.
+    // In future, this shall be mouse_down_point for primary button
+    #[no_trace]
+    relative_mouse_down_point: Cell<Point2D<f32, DevicePixel>>,
 }
 
 struct BHMExitSignal {
@@ -944,6 +959,8 @@ impl ScriptThread {
             gpu_id_hub: Arc::new(IdentityHub::default()),
             inherited_secure_context: state.inherited_secure_context,
             layout_factory,
+            mouse_down_button: Cell::new(None),
+            relative_mouse_down_point: Cell::new(Point2D::zero()),
         }
     }
 
@@ -1947,7 +1964,7 @@ impl ScriptThread {
                 msg,
             } => {
                 let global = self.documents.borrow().find_global(pipeline_id).unwrap();
-                global.gpu_device_lost(device, reason, msg);
+                global.gpu_device_lost(device, reason, msg, can_gc);
             },
             WebGPUMsg::UncapturedError {
                 device,
@@ -2250,6 +2267,14 @@ impl ScriptThread {
             WebDriverScriptCommand::GetActiveElement(reply) => {
                 webdriver_handlers::handle_get_active_element(&documents, pipeline_id, reply)
             },
+            WebDriverScriptCommand::GetComputedRole(node_id, reply) => {
+                webdriver_handlers::handle_get_computed_role(
+                    &documents,
+                    pipeline_id,
+                    node_id,
+                    reply,
+                )
+            },
             WebDriverScriptCommand::GetPageSource(reply) => {
                 webdriver_handlers::handle_get_page_source(&documents, pipeline_id, reply, can_gc)
             },
@@ -2424,10 +2449,19 @@ impl ScriptThread {
         let documents = self.documents.borrow();
         let urls = itertools::join(documents.iter().map(|(_, d)| d.url().to_string()), ", ");
 
-        let mut reports = self.get_cx().get_reports(format!("url({})", urls));
-        for (_, document) in documents.iter() {
-            document.window().layout().collect_reports(&mut reports);
-        }
+        let mut reports = vec![];
+        perform_memory_report(|ops| {
+            let prefix = format!("url({urls})");
+            reports.extend(self.get_cx().get_reports(prefix.clone(), ops));
+            for (_, document) in documents.iter() {
+                document
+                    .window()
+                    .layout()
+                    .collect_reports(&mut reports, ops);
+            }
+
+            reports.push(self.image_cache.memory_report(&prefix, ops));
+        });
 
         reports_chan.send(ProcessReports::new(reports));
     }
@@ -3153,20 +3187,17 @@ impl ScriptThread {
             Some(final_url.clone()),
         );
 
-        let content_type: Option<Mime> =
-            metadata.content_type.map(Serde::into_inner).map(Into::into);
+        let content_type: Option<Mime> = metadata
+            .content_type
+            .map(Serde::into_inner)
+            .map(Mime::from_ct);
 
         let is_html_document = match content_type {
-            Some(ref mime)
-                if mime.type_() == mime::APPLICATION && mime.suffix() == Some(mime::XML) =>
-            {
+            Some(ref mime) if mime.type_ == APPLICATION && mime.has_suffix("xml") => {
                 IsHTMLDocument::NonHTMLDocument
             },
 
-            Some(ref mime)
-                if (mime.type_() == mime::TEXT && mime.subtype() == mime::XML) ||
-                    (mime.type_() == mime::APPLICATION && mime.subtype() == mime::XML) =>
-            {
+            Some(ref mime) if mime.matches(TEXT, XML) || mime.matches(APPLICATION, XML) => {
                 IsHTMLDocument::NonHTMLDocument
             },
             _ => IsHTMLDocument::HTMLDocument,
@@ -3205,8 +3236,14 @@ impl ScriptThread {
             .as_deref()
             .and_then(|h| h.typed_get::<ReferrerPolicyHeader>())
             .into();
-
         document.set_referrer_policy(referrer_policy);
+
+        let refresh_header = metadata.headers.as_deref().and_then(|h| h.get(REFRESH));
+        if let Some(refresh_val) = refresh_header {
+            // There are tests that this header handles Unicode code points
+            document.shared_declarative_refresh_steps(refresh_val.as_bytes());
+        }
+
         document.set_ready_state(DocumentReadyState::Loading, can_gc);
 
         self.documents
@@ -3316,7 +3353,47 @@ impl ScriptThread {
             warn!("Compositor event sent to closed pipeline {pipeline_id}.");
             return;
         };
-        document.note_pending_input_event(event);
+
+        if let InputEvent::MouseButton(mouse_button_event) = event.event {
+            if mouse_button_event.action == MouseButtonAction::Down {
+                self.mouse_down_button.set(Some(mouse_button_event.button));
+                self.relative_mouse_down_point.set(mouse_button_event.point)
+            }
+        }
+        document.note_pending_input_event(event.clone());
+
+        // Also send a 'click' event with same hit-test result if this is release
+
+        // MAYBE? TODO: https://developer.mozilla.org/en-US/docs/Web/API/Element/click_event
+        // If the button is pressed on one element and the pointer is moved outside the element
+        // before the button is released, the event is fired on the most specific ancestor element
+        // that contained both elements.
+
+        // But spec doesn't specify this https://w3c.github.io/uievents/#event-type-click
+
+        // Servo-specific: Trigger if within 10px of the down point
+        if let InputEvent::MouseButton(mouse_button_event) = event.event {
+            if let (Some(mouse_down_button), MouseButtonAction::Up) =
+                (self.mouse_down_button.get(), mouse_button_event.action)
+            {
+                let pixel_dist = self.relative_mouse_down_point.get() - mouse_button_event.point;
+                let pixel_dist = (pixel_dist.x * pixel_dist.x + pixel_dist.y * pixel_dist.y).sqrt();
+                if mouse_down_button == mouse_button_event.button &&
+                    pixel_dist < 10.0 * document.window().device_pixel_ratio().get()
+                {
+                    document.note_pending_input_event(ConstellationInputEvent {
+                        hit_test_result: event.hit_test_result,
+                        pressed_mouse_buttons: event.pressed_mouse_buttons,
+                        active_keyboard_modifiers: event.active_keyboard_modifiers,
+                        event: InputEvent::MouseButton(MouseButtonEvent {
+                            action: MouseButtonAction::Click,
+                            button: mouse_button_event.button,
+                            point: mouse_button_event.point,
+                        }),
+                    });
+                }
+            }
+        }
     }
 
     /// Handle a "navigate an iframe" message from the constellation.
@@ -3413,8 +3490,11 @@ impl ScriptThread {
             FetchResponseMsg::ProcessResponseEOF(request_id, eof) => {
                 self.handle_fetch_eof(pipeline_id, request_id, eof)
             },
-            FetchResponseMsg::ProcessRequestBody(..) => {},
-            FetchResponseMsg::ProcessRequestEOF(..) => {},
+            FetchResponseMsg::ProcessCspViolations(request_id, violations) => {
+                self.handle_csp_violations(pipeline_id, request_id, violations)
+            },
+            FetchResponseMsg::ProcessRequestBody(..) | FetchResponseMsg::ProcessRequestEOF(..) => {
+            },
         }
     }
 
@@ -3467,6 +3547,12 @@ impl ScriptThread {
         if let Some(idx) = idx {
             let (_, mut ctxt) = self.incomplete_parser_contexts.0.borrow_mut().remove(idx);
             ctxt.process_response_eof(request_id, eof);
+        }
+    }
+
+    fn handle_csp_violations(&self, id: PipelineId, _: RequestId, violations: Vec<csp::Violation>) {
+        if let Some(global) = self.documents.borrow().find_global(id) {
+            global.report_csp_violations(violations);
         }
     }
 

@@ -23,8 +23,8 @@ use crate::fragment_tree::{
     BoxFragment, CollapsedBlockMargins, Fragment, FragmentFlags, SpecificLayoutInfo,
 };
 use crate::geom::{
-    LogicalSides, LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize, Size,
-    SizeConstraint, Sizes,
+    LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize, Size, SizeConstraint,
+    Sizes,
 };
 use crate::layout_box_base::CacheableLayoutResult;
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext, PositioningContextLength};
@@ -486,15 +486,6 @@ impl TaffyContainer {
             .map(|child| (**child).borrow_mut())
             .enumerate()
             .map(|(child_id, mut child)| {
-                fn rect_to_logical_sides<T>(rect: taffy::Rect<T>) -> LogicalSides<T> {
-                    LogicalSides {
-                        inline_start: rect.left,
-                        inline_end: rect.right,
-                        block_start: rect.top,
-                        block_end: rect.bottom,
-                    }
-                }
-
                 fn rect_to_physical_sides<T>(rect: taffy::Rect<T>) -> PhysicalSides<T> {
                     PhysicalSides::new(rect.top, rect.right, rect.bottom, rect.left)
                 }
@@ -514,8 +505,6 @@ impl TaffyContainer {
                 let padding = rect_to_physical_sides(layout.padding.map(Au::from_f32_px));
                 let border = rect_to_physical_sides(layout.border.map(Au::from_f32_px));
                 let margin = rect_to_physical_sides(layout.margin.map(Au::from_f32_px));
-                let logical_margin = rect_to_logical_sides(layout.margin.map(Au::from_f32_px));
-                let collapsed_margin = CollapsedBlockMargins::from_margin(&logical_margin);
 
                 // Compute content box size and position.
                 //
@@ -561,7 +550,7 @@ impl TaffyContainer {
                         false
                     };
 
-                match &mut child.taffy_level_box {
+                let fragment = match &mut child.taffy_level_box {
                     TaffyItemBoxInner::InFlowBox(independent_box) => {
                         let mut fragment_info = independent_box.base_fragment_info();
                         fragment_info
@@ -576,7 +565,6 @@ impl TaffyContainer {
                             border,
                             margin,
                             None, /* clearance */
-                            collapsed_margin,
                         )
                         .with_baselines(Baselines {
                             first: output.first_baselines.y.map(Au::from_f32_px),
@@ -606,7 +594,6 @@ impl TaffyContainer {
                         container_ctx
                             .positioning_context
                             .append(child_positioning_context);
-
                         fragment
                     },
                     TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(abs_pos_box) => {
@@ -640,7 +627,16 @@ impl TaffyContainer {
                         container_ctx.positioning_context.push(hoisted_box);
                         Fragment::AbsoluteOrFixedPositioned(hoisted_fragment)
                     },
+                };
+
+                if let TaffyItemBoxInner::InFlowBox(independent_formatting_context) =
+                    &child.taffy_level_box
+                {
+                    independent_formatting_context
+                        .base
+                        .set_fragment(fragment.clone());
                 }
+                fragment
             })
             .collect();
 

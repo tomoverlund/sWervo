@@ -5,6 +5,7 @@
 use std::mem;
 
 use app_units::Au;
+use malloc_size_of_derive::MallocSizeOf;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator};
 use style::Zero;
@@ -21,8 +22,7 @@ use crate::formatting_contexts::{
     IndependentFormattingContext, IndependentFormattingContextContents,
 };
 use crate::fragment_tree::{
-    BoxFragment, CollapsedBlockMargins, Fragment, FragmentFlags, HoistedSharedFragment,
-    SpecificLayoutInfo,
+    BoxFragment, Fragment, FragmentFlags, HoistedSharedFragment, SpecificLayoutInfo,
 };
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, LogicalRect, LogicalSides, LogicalSides1D, LogicalVec2,
@@ -36,12 +36,12 @@ use crate::{
     PropagatedBoxTreeData, SizeConstraint,
 };
 
-#[derive(Debug)]
+#[derive(Debug, MallocSizeOf)]
 pub(crate) struct AbsolutelyPositionedBox {
     pub context: IndependentFormattingContext,
 }
 
-#[derive(Clone)]
+#[derive(Clone, MallocSizeOf)]
 pub(crate) struct PositioningContext {
     for_nearest_positioned_ancestor: Option<Vec<HoistedAbsolutelyPositionedBox>>,
 
@@ -51,7 +51,7 @@ pub(crate) struct PositioningContext {
     for_nearest_containing_block_for_all_descendants: Vec<HoistedAbsolutelyPositionedBox>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, MallocSizeOf)]
 pub(crate) struct HoistedAbsolutelyPositionedBox {
     absolutely_positioned_box: ArcRefCell<AbsolutelyPositionedBox>,
 
@@ -437,9 +437,8 @@ impl HoistedAbsolutelyPositionedBox {
                         containing_block_padding,
                     );
 
-                    hoisted_box.fragment.borrow_mut().fragment =
-                        Some(Fragment::Box(new_fragment.clone()));
-                    (Fragment::Box(new_fragment), new_hoisted_boxes)
+                    hoisted_box.fragment.borrow_mut().fragment = Some(new_fragment.clone());
+                    (new_fragment, new_hoisted_boxes)
                 })
                 .unzip_into_vecs(&mut new_fragments, &mut new_hoisted_boxes);
 
@@ -455,8 +454,8 @@ impl HoistedAbsolutelyPositionedBox {
                     containing_block_padding,
                 );
 
-                box_.fragment.borrow_mut().fragment = Some(Fragment::Box(new_fragment.clone()));
-                Fragment::Box(new_fragment)
+                box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
+                new_fragment
             }))
         }
     }
@@ -467,7 +466,7 @@ impl HoistedAbsolutelyPositionedBox {
         for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
         containing_block_padding: PhysicalSides<Au>,
-    ) -> ArcRefCell<BoxFragment> {
+    ) -> Fragment {
         let cbis = containing_block.size.inline;
         let cbbs = containing_block.size.block;
         let containing_block_writing_mode = containing_block.style.writing_mode;
@@ -697,9 +696,6 @@ impl HoistedAbsolutelyPositionedBox {
                 pbm.border.to_physical(containing_block_writing_mode),
                 margin.to_physical(containing_block_writing_mode),
                 None, /* clearance */
-                // We do not set the baseline offset, because absolutely positioned
-                // elements are not inflow.
-                CollapsedBlockMargins::zero(),
             )
             .with_specific_layout_info(specific_layout_info)
         };
@@ -718,7 +714,9 @@ impl HoistedAbsolutelyPositionedBox {
         for_nearest_containing_block_for_all_descendants
             .extend(positioning_context.for_nearest_containing_block_for_all_descendants);
 
-        ArcRefCell::new(new_fragment)
+        let fragment = Fragment::Box(ArcRefCell::new(new_fragment));
+        context.base.set_fragment(fragment.clone());
+        fragment
     }
 }
 
