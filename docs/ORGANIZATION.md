@@ -1,2 +1,2 @@
-# Swervo’s directory structure
+# sWervo’s directory structure
 
