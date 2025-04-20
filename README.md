@@ -1,6 +1,6 @@
-# Swervo Browser
+# sWervo Browser
 
-Swervo is a hard fork of [Servo](https://github.com/servo/servo).
+sWervo is a hard fork of [Servo](https://github.com/servo/servo).
 
 ## Getting started
 
