@@ -547,6 +547,7 @@ pub(crate) mod submitevent;
 pub(crate) mod subtlecrypto;
 pub(crate) mod svgelement;
 pub(crate) mod svggraphicselement;
+pub(crate) mod svgimageelement;
 pub(crate) mod svgsvgelement;
 pub(crate) mod testbinding;
 pub(crate) mod testbindingiterable;
@@ -631,6 +632,8 @@ pub(crate) mod webgpu;
 pub(crate) use self::webgpu::*;
 #[cfg(not(feature = "webgpu"))]
 pub(crate) mod gpucanvascontext;
+pub(crate) mod transformstream;
+pub(crate) mod transformstreamdefaultcontroller;
 pub(crate) mod wheelevent;
 #[allow(dead_code)]
 pub(crate) mod window;

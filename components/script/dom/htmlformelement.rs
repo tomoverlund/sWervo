@@ -9,7 +9,7 @@ use constellation_traits::{LoadData, LoadOrigin, NavigationHistoryBehavior};
 use dom_struct::dom_struct;
 use encoding_rs::{Encoding, UTF_8};
 use headers::{ContentType, HeaderMapExt};
-use html5ever::{LocalName, Prefix, local_name, namespace_url, ns};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use http::Method;
 use js::rust::HandleObject;
 use mime::{self, Mime};
@@ -1270,8 +1270,14 @@ impl HTMLFormElement {
             return;
         }
 
-        let controls = self.controls.borrow();
-        for child in controls.iter() {
+        let controls: Vec<_> = self
+            .controls
+            .borrow()
+            .iter()
+            .map(|c| c.as_rooted())
+            .collect();
+
+        for child in controls {
             let child = child.upcast::<Node>();
 
             match child.type_id() {

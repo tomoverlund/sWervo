@@ -12,6 +12,7 @@ use std::time::Duration;
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::{PipelineId, PipelineNamespace};
 use constellation_traits::WorkerGlobalScopeInit;
+use content_security_policy::CspList;
 use crossbeam_channel::Receiver;
 use devtools_traits::{DevtoolScriptControlMsg, WorkerId};
 use dom_struct::dom_struct;
@@ -39,7 +40,9 @@ use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestInit;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WorkerBinding::WorkerType;
 use crate::dom::bindings::codegen::Bindings::WorkerGlobalScopeBinding::WorkerGlobalScopeMethods;
-use crate::dom::bindings::codegen::UnionTypes::{RequestOrUSVString, StringOrFunction};
+use crate::dom::bindings::codegen::UnionTypes::{
+    RequestOrUSVString, StringOrFunction, TrustedScriptURLOrUSVString,
+};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible, report_pending_exception};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomObject;
@@ -52,6 +55,7 @@ use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerGlobalScope;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::performance::Performance;
 use crate::dom::promise::Promise;
+use crate::dom::trustedscripturl::TrustedScriptURL;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
@@ -246,6 +250,10 @@ impl WorkerGlobalScope {
         self.policy_container.borrow()
     }
 
+    pub(crate) fn set_csp_list(&self, csp_list: Option<CspList>) {
+        self.policy_container.borrow_mut().set_csp_list(csp_list);
+    }
+
     /// Get a mutable reference to the [`TimerScheduler`] for this [`ServiceWorkerGlobalScope`].
     pub(crate) fn timer_scheduler(&self) -> RefMut<TimerScheduler> {
         self.timer_scheduler.borrow_mut()
@@ -276,9 +284,25 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
     error_event_handler!(error, GetOnerror, SetOnerror);
 
     // https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-importscripts
-    fn ImportScripts(&self, url_strings: Vec<DOMString>, can_gc: CanGc) -> ErrorResult {
+    fn ImportScripts(
+        &self,
+        url_strings: Vec<TrustedScriptURLOrUSVString>,
+        can_gc: CanGc,
+    ) -> ErrorResult {
+        // Step 1: Let urlStrings be « ».
         let mut urls = Vec::with_capacity(url_strings.len());
+        // Step 2: For each url of urls:
         for url in url_strings {
+            // Step 3: Append the result of invoking the Get Trusted Type compliant string algorithm
+            // with TrustedScriptURL, this's relevant global object, url, "WorkerGlobalScope importScripts",
+            // and "script" to urlStrings.
+            let url = TrustedScriptURL::get_trusted_script_url_compliant_string(
+                self.upcast::<GlobalScope>(),
+                url,
+                "WorkerGlobalScope",
+                "importScripts",
+                can_gc,
+            )?;
             let url = self.worker_url.borrow().join(&url);
             match url {
                 Ok(url) => urls.push(url),
@@ -300,6 +324,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             .use_url_credentials(true)
             .origin(global_scope.origin().immutable().clone())
             .insecure_requests_policy(self.insecure_requests_policy())
+            .policy_container(global_scope.policy_container())
             .has_trustworthy_ancestor_origin(
                 global_scope.has_trustworthy_ancestor_or_current_origin(),
             )

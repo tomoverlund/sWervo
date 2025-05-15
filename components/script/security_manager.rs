@@ -14,8 +14,7 @@ use crate::dom::bindings::codegen::Bindings::SecurityPolicyViolationEventBinding
 };
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::event::{Event, EventBubbles, EventCancelable};
+use crate::dom::event::{Event, EventBubbles, EventCancelable, EventComposed};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::securitypolicyviolationevent::SecurityPolicyViolationEvent;
 use crate::dom::types::GlobalScope;
@@ -23,6 +22,7 @@ use crate::script_runtime::CanGc;
 use crate::task::TaskOnce;
 
 pub(crate) struct CSPViolationReportTask {
+    global: Trusted<GlobalScope>,
     event_target: Trusted<EventTarget>,
     violation_report: SecurityPolicyViolationReport,
 }
@@ -62,6 +62,8 @@ pub(crate) struct CSPViolationReportBuilder {
     pub source_file: String,
     /// <https://www.w3.org/TR/CSP3/#violation-effective-directive>
     pub effective_directive: String,
+    /// <https://www.w3.org/TR/CSP3/#violation-policy>
+    pub original_policy: String,
 }
 
 impl CSPViolationReportBuilder {
@@ -106,6 +108,12 @@ impl CSPViolationReportBuilder {
         self
     }
 
+    /// <https://www.w3.org/TR/CSP3/#violation-policy>
+    pub fn original_policy(mut self, original_policy: String) -> CSPViolationReportBuilder {
+        self.original_policy = original_policy;
+        self
+    }
+
     /// <https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>
     fn strip_url_for_reports(&self, mut url: ServoUrl) -> String {
         let scheme = url.scheme();
@@ -141,7 +149,7 @@ impl CSPViolationReportBuilder {
             sample: self.sample,
             blocked_url: self.resource,
             source_file: self.source_file,
-            original_policy: "".to_owned(),
+            original_policy: self.original_policy,
             line_number: self.line_number,
             column_number: self.column_number,
             status_code: global.status_code().unwrap_or(0),
@@ -151,28 +159,31 @@ impl CSPViolationReportBuilder {
 
 impl CSPViolationReportTask {
     pub fn new(
-        global: &GlobalScope,
-        report: SecurityPolicyViolationReport,
+        global: Trusted<GlobalScope>,
+        event_target: Trusted<EventTarget>,
+        violation_report: SecurityPolicyViolationReport,
     ) -> CSPViolationReportTask {
         CSPViolationReportTask {
-            violation_report: report,
-            event_target: Trusted::new(global.upcast::<EventTarget>()),
+            global,
+            event_target,
+            violation_report,
         }
     }
 
     fn fire_violation_event(self, can_gc: CanGc) {
-        let target = self.event_target.root();
-        let global = &target.global();
         let event = SecurityPolicyViolationEvent::new(
-            global,
+            &self.global.root(),
             Atom::from("securitypolicyviolation"),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
+            EventComposed::Composed,
             &self.violation_report.convert(),
             can_gc,
         );
 
-        event.upcast::<Event>().fire(&target, can_gc);
+        event
+            .upcast::<Event>()
+            .fire(&self.event_target.root(), can_gc);
     }
 }
 

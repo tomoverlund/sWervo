@@ -10,7 +10,7 @@ use base::id::WebViewId;
 use content_security_policy as csp;
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
-use html5ever::{LocalName, Prefix, local_name, namespace_url, ns};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{
@@ -31,7 +31,6 @@ use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DOMTokenListBinding::DOMTokenList_Binding::DOMTokenListMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLLinkElementBinding::HTMLLinkElementMethods;
-use crate::dom::bindings::codegen::GenericBindings::HTMLElementBinding::HTMLElement_Binding::HTMLElementMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
@@ -98,7 +97,7 @@ pub(crate) struct HTMLLinkElement {
     #[no_trace]
     relations: Cell<LinkRelations>,
 
-    #[ignore_malloc_size_of = "Arc"]
+    #[conditional_malloc_size_of]
     #[no_trace]
     stylesheet: DomRefCell<Option<Arc<Stylesheet>>>,
     cssom_stylesheet: MutNullableDom<CSSStyleSheet>,
@@ -344,7 +343,7 @@ impl HTMLLinkElement {
             destination: Some(destination),
             integrity: String::new(),
             link_type: String::new(),
-            cryptographic_nonce_metadata: self.upcast::<HTMLElement>().Nonce().into(),
+            cryptographic_nonce_metadata: self.upcast::<Element>().nonce_value(),
             cross_origin: cors_setting_for_element(element),
             referrer_policy: referrer_policy_for_element(element),
             policy_container: document.policy_container().to_owned(),
@@ -773,7 +772,7 @@ impl FetchResponseListener for PrefetchContext {
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations);
+        global.report_csp_violations(violations, None);
     }
 }
 

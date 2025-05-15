@@ -3,12 +3,15 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ptr::{self};
 use std::rc::Rc;
-use std::collections::HashMap;
 
+use base::id::{MessagePortId, MessagePortIndex};
+use constellation_traits::MessagePortImpl;
 use dom_struct::dom_struct;
+use ipc_channel::ipc::IpcSharedMemory;
 use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, NullValue, ObjectValue, UndefinedValue};
@@ -20,12 +23,14 @@ use js::typedarray::ArrayBufferViewU8;
 
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::{
-    ReadableStreamGetReaderOptions, ReadableStreamMethods, ReadableStreamReaderMode, StreamPipeOptions
+    ReadableStreamGetReaderOptions, ReadableStreamMethods, ReadableStreamReaderMode,
+    StreamPipeOptions,
 };
 use script_bindings::str::DOMString;
 
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use script_bindings::conversions::StringificationBehavior;
+use super::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultReaderBinding::ReadableStreamDefaultReaderMethods;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultControllerBinding::ReadableStreamDefaultController_Binding::ReadableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource as JsUnderlyingSource;
@@ -56,10 +61,8 @@ use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use base::id::MessagePortId;
-use constellation_traits::MessagePortImpl;
 use crate::dom::bindings::transferable::Transferable;
-use crate::dom::bindings::structuredclone::{StructuredData, StructuredDataReader};
+use crate::dom::bindings::structuredclone::StructuredData;
 
 use super::bindings::buffer_source::HeapBufferSource;
 use super::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::ReadableStreamBYOBReaderReadOptions;
@@ -640,7 +643,7 @@ impl PipeTo {
                     .reader
                     .get_stream()
                     .expect("Reader should have a stream.");
-                source.cancel(error.handle(), can_gc)
+                source.cancel(cx, global, error.handle(), can_gc)
             },
             ShutdownAction::WritableStreamDefaultWriterCloseWithErrorPropagation => {
                 self.writer.close_with_error_propagation(cx, global, can_gc)
@@ -766,19 +769,19 @@ impl PartialEq for ReaderType {
 
 /// <https://streams.spec.whatwg.org/#create-readable-stream>
 #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-fn create_readable_stream(
+pub(crate) fn create_readable_stream(
     global: &GlobalScope,
     underlying_source_type: UnderlyingSourceType,
-    queuing_strategy: QueuingStrategy,
+    queuing_strategy: Option<Rc<QueuingStrategySize>>,
+    high_water_mark: Option<f64>,
     can_gc: CanGc,
 ) -> DomRoot<ReadableStream> {
     // If highWaterMark was not passed, set it to 1.
-    let high_water_mark = queuing_strategy.highWaterMark.unwrap_or(1.0);
+    let high_water_mark = high_water_mark.unwrap_or(1.0);
 
     // If sizeAlgorithm was not passed, set it to an algorithm that returns 1.
-    let size_algorithm = queuing_strategy
-        .size
-        .unwrap_or(extract_size_algorithm(&QueuingStrategy::empty(), can_gc));
+    let size_algorithm =
+        queuing_strategy.unwrap_or(extract_size_algorithm(&QueuingStrategy::empty(), can_gc));
 
     // Assert: ! IsNonNegativeNumber(highWaterMark) is true.
     assert!(high_water_mark >= 0.0);
@@ -1129,12 +1132,14 @@ impl ReadableStream {
 
     /// Return bytes for synchronous use, if the stream has all data in memory.
     /// Useful for native source integration only.
-    pub(crate) fn get_in_memory_bytes(&self) -> Option<Vec<u8>> {
+    pub(crate) fn get_in_memory_bytes(&self) -> Option<IpcSharedMemory> {
         match self.controller.borrow().as_ref() {
             Some(ControllerType::Default(controller)) => controller
                 .get()
                 .expect("Stream should have controller.")
-                .get_in_memory_bytes(),
+                .get_in_memory_bytes()
+                .as_deref()
+                .map(IpcSharedMemory::from_bytes),
             _ => {
                 unreachable!("Getting in-memory bytes for a stream with a non-default controller")
             },
@@ -1437,19 +1442,24 @@ impl ReadableStream {
 
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>
     #[allow(unsafe_code)]
-    pub(crate) fn cancel(&self, reason: SafeHandleValue, can_gc: CanGc) -> Rc<Promise> {
+    pub(crate) fn cancel(
+        &self,
+        cx: SafeJSContext,
+        global: &GlobalScope,
+        reason: SafeHandleValue,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
         // Set stream.[[disturbed]] to true.
         self.disturbed.set(true);
 
         // If stream.[[state]] is "closed", return a promise resolved with undefined.
         if self.is_closed() {
-            return Promise::new_resolved(&self.global(), GlobalScope::get_cx(), (), can_gc);
+            return Promise::new_resolved(global, cx, (), can_gc);
         }
         // If stream.[[state]] is "errored", return a promise rejected with stream.[[storedError]].
         if self.is_errored() {
-            let promise = Promise::new(&self.global(), can_gc);
+            let promise = Promise::new(global, can_gc);
             unsafe {
-                let cx = GlobalScope::get_cx();
                 rooted!(in(*cx) let mut rval = UndefinedValue());
                 self.stored_error.to_jsval(*cx, rval.handle_mut());
                 promise.reject_native(&rval.handle(), can_gc);
@@ -1473,11 +1483,11 @@ impl ReadableStream {
             Some(ControllerType::Default(controller)) => controller
                 .get()
                 .expect("Stream should have controller.")
-                .perform_cancel_steps(reason, can_gc),
+                .perform_cancel_steps(cx, global, reason, can_gc),
             Some(ControllerType::Byte(controller)) => controller
                 .get()
                 .expect("Stream should have controller.")
-                .perform_cancel_steps(reason, can_gc),
+                .perform_cancel_steps(cx, global, reason, can_gc),
             None => {
                 panic!("Stream does not have a controller.");
             },
@@ -1587,7 +1597,8 @@ impl ReadableStream {
         let branch_1 = create_readable_stream(
             &self.global(),
             underlying_source_type_branch_1,
-            QueuingStrategy::empty(),
+            None,
+            None,
             can_gc,
         );
         tee_source_1.set_branch_1(&branch_1);
@@ -1597,7 +1608,8 @@ impl ReadableStream {
         let branch_2 = create_readable_stream(
             &self.global(),
             underlying_source_type_branch_2,
-            QueuingStrategy::empty(),
+            None,
+            None,
             can_gc,
         );
         tee_source_1.set_branch_2(&branch_2);
@@ -1816,7 +1828,7 @@ impl ReadableStream {
         global.note_cross_realm_transform_readable(&cross_realm_transform_readable, port_id);
 
         // Enable port’s port message queue.
-        port.Start();
+        port.Start(can_gc);
 
         // Perform ! SetUpReadableStreamDefaultController
         controller
@@ -1908,16 +1920,17 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#rs-cancel>
-    fn Cancel(&self, _cx: SafeJSContext, reason: SafeHandleValue, can_gc: CanGc) -> Rc<Promise> {
+    fn Cancel(&self, cx: SafeJSContext, reason: SafeHandleValue, can_gc: CanGc) -> Rc<Promise> {
+        let global = self.global();
         if self.is_locked() {
             // If ! IsReadableStreamLocked(this) is true,
             // return a promise rejected with a TypeError exception.
-            let promise = Promise::new(&self.global(), can_gc);
+            let promise = Promise::new(&global, can_gc);
             promise.reject_error(Error::Type("stream is not locked".to_owned()), can_gc);
             promise
         } else {
             // Return ! ReadableStreamCancel(this, reason).
-            self.cancel(reason, can_gc)
+            self.cancel(cx, &global, reason, can_gc)
         }
     }
 
@@ -2083,27 +2096,16 @@ impl CrossRealmTransformReadable {
             self.controller.close(can_gc);
 
             // Disentangle port.
-            global.disentangle_port(port);
+            global.disentangle_port(port, can_gc);
         }
 
         // Otherwise, if type is "error",
         if type_string == "error" {
-            if value.is_undefined() {
-                // Note: for DataClone errors, we send UndefinedValue across,
-                // because somehow sending the error results in another error.
-                // The error is then created here.
-                rooted!(in(*cx) let mut rooted_error = UndefinedValue());
-                Error::DataClone(None).to_jsval(cx, global, rooted_error.handle_mut(), can_gc);
-
-                // Perform ! ReadableStreamDefaultControllerError(controller, value).
-                self.controller.error(rooted_error.handle(), can_gc);
-            } else {
-                // Perform ! ReadableStreamDefaultControllerError(controller, value).
-                self.controller.error(value.handle(), can_gc);
-            }
+            // Perform ! ReadableStreamDefaultControllerError(controller, value).
+            self.controller.error(value.handle(), can_gc);
 
             // Disentangle port.
-            global.disentangle_port(port);
+            global.disentangle_port(port, can_gc);
         }
     }
 
@@ -2130,7 +2132,7 @@ impl CrossRealmTransformReadable {
         self.controller.error(rooted_error.handle(), can_gc);
 
         // Disentangle port.
-        global.disentangle_port(port);
+        global.disentangle_port(port, can_gc);
     }
 }
 
@@ -2190,7 +2192,7 @@ pub(crate) fn get_read_promise_bytes(
 
 /// <https://streams.spec.whatwg.org/#rs-transfer>
 impl Transferable for ReadableStream {
-    type Id = MessagePortId;
+    type Index = MessagePortIndex;
     type Data = MessagePortImpl;
 
     /// <https://streams.spec.whatwg.org/#ref-for-readablestream%E2%91%A1%E2%91%A0>
@@ -2258,14 +2260,12 @@ impl Transferable for ReadableStream {
     }
 
     /// Note: we are relying on the port transfer, so the data returned here are related to the port.
-    fn serialized_storage(data: StructuredData<'_>) -> &mut Option<HashMap<Self::Id, Self::Data>> {
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,
         }
-    }
-
-    fn deserialized_storage(reader: &mut StructuredDataReader) -> &mut Option<Vec<DomRoot<Self>>> {
-        &mut reader.readable_streams
     }
 }

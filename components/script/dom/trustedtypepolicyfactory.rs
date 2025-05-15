@@ -5,7 +5,8 @@ use std::cell::RefCell;
 
 use content_security_policy::CheckResult;
 use dom_struct::dom_struct;
-use html5ever::{LocalName, Namespace, QualName, local_name, namespace_url, ns};
+use html5ever::{LocalName, Namespace, QualName, local_name, ns};
+use js::jsval::NullValue;
 use js::rust::HandleValue;
 
 use crate::dom::bindings::codegen::Bindings::TrustedTypePolicyFactoryBinding::{
@@ -20,7 +21,8 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::trustedscript::TrustedScript;
 use crate::dom::trustedscripturl::TrustedScriptURL;
-use crate::dom::trustedtypepolicy::TrustedTypePolicy;
+use crate::dom::trustedtypepolicy::{TrustedType, TrustedTypePolicy};
+use crate::js::conversions::ToJSValConvertible;
 use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
@@ -64,7 +66,7 @@ impl TrustedTypePolicyFactory {
             (CheckResult::Allowed, Vec::new())
         };
 
-        global.report_csp_violations(violations);
+        global.report_csp_violations(violations, None);
 
         // Step 2: If allowedByCSP is "Blocked", throw a TypeError and abort further steps.
         if allowed_by_csp == CheckResult::Blocked {
@@ -136,6 +138,114 @@ impl TrustedTypePolicyFactory {
         }
         // Step 4: Return data.
         data
+    }
+    /// <https://w3c.github.io/trusted-types/dist/spec/#process-value-with-a-default-policy-algorithm>
+    #[allow(unsafe_code)]
+    pub(crate) fn process_value_with_default_policy(
+        expected_type: TrustedType,
+        global: &GlobalScope,
+        input: String,
+        sink: &str,
+        can_gc: CanGc,
+    ) -> Fallible<Option<String>> {
+        // Step 1: Let defaultPolicy be the value of global’s trusted type policy factory's default policy.
+        let global_policy_factory = global.trusted_types(can_gc);
+        let default_policy = match global_policy_factory.default_policy.get() {
+            None => return Ok(None),
+            Some(default_policy) => default_policy,
+        };
+        let cx = GlobalScope::get_cx();
+        // Step 2: Let policyValue be the result of executing Get Trusted Type policy value,
+        // with the following arguments:
+        rooted!(in(*cx) let mut trusted_type_name_value = NullValue());
+        unsafe {
+            let trusted_type_name: &'static str = expected_type.clone().into();
+            trusted_type_name.to_jsval(*cx, trusted_type_name_value.handle_mut());
+        }
+
+        rooted!(in(*cx) let mut sink_value = NullValue());
+        unsafe {
+            sink.to_jsval(*cx, sink_value.handle_mut());
+        }
+
+        let arguments = vec![trusted_type_name_value.handle(), sink_value.handle()];
+        let policy_value = default_policy.get_trusted_type_policy_value(
+            expected_type,
+            cx,
+            DOMString::from(input.to_owned()),
+            arguments,
+            false,
+            can_gc,
+        );
+        let data_string = match policy_value {
+            // Step 3: If the algorithm threw an error, rethrow the error and abort the following steps.
+            Err(error) => return Err(error),
+            Ok(policy_value) => match policy_value {
+                // Step 4: If policyValue is null or undefined, return policyValue.
+                None => return Ok(None),
+                // Step 5: Let dataString be the result of stringifying policyValue.
+                Some(policy_value) => policy_value,
+            },
+        };
+        Ok(Some(data_string))
+    }
+    /// Step 1 is implemented by the caller
+    /// <https://w3c.github.io/trusted-types/dist/spec/#get-trusted-type-compliant-string-algorithm>
+    pub(crate) fn get_trusted_type_compliant_string(
+        expected_type: TrustedType,
+        global: &GlobalScope,
+        input: String,
+        sink: &str,
+        sink_group: &str,
+        can_gc: CanGc,
+    ) -> Fallible<String> {
+        let csp_list = match global.get_csp_list() {
+            None => return Ok(input),
+            Some(csp_list) => csp_list,
+        };
+        // Step 2: Let requireTrustedTypes be the result of executing Does sink type require trusted types?
+        // algorithm, passing global, sinkGroup, and true.
+        let require_trusted_types = csp_list.does_sink_type_require_trusted_types(sink_group, true);
+        // Step 3: If requireTrustedTypes is false, return stringified input and abort these steps.
+        if !require_trusted_types {
+            return Ok(input);
+        }
+        // Step 4: Let convertedInput be the result of executing Process value with a default policy
+        // with the same arguments as this algorithm.
+        let converted_input = TrustedTypePolicyFactory::process_value_with_default_policy(
+            expected_type,
+            global,
+            input.clone(),
+            sink,
+            can_gc,
+        );
+        // Step 5: If the algorithm threw an error, rethrow the error and abort the following steps.
+        match converted_input? {
+            // Step 6: If convertedInput is null or undefined, execute the following steps:
+            None => {
+                // Step 6.1: Let disposition be the result of executing Should sink type mismatch violation
+                // be blocked by Content Security Policy? algorithm, passing global,
+                // stringified input as source, sinkGroup and sink.
+                let (disposition, violations) = csp_list
+                    .should_sink_type_mismatch_violation_be_blocked_by_csp(
+                        sink, sink_group, &input,
+                    );
+                global.report_csp_violations(violations, None);
+                // Step 6.2: If disposition is “Allowed”, return stringified input and abort further steps.
+                if disposition == CheckResult::Allowed {
+                    Ok(input)
+                } else {
+                    // Step 6.3: Throw a TypeError and abort further steps.
+                    Err(Error::Type(
+                        "Cannot set value, expected trusted type".to_owned(),
+                    ))
+                }
+            },
+            // Step 8: Return stringified convertedInput.
+            Some(converted_input) => Ok(converted_input),
+        }
+        // Step 7: Assert: convertedInput is an instance of expectedType.
+        // TODO(https://github.com/w3c/trusted-types/issues/566): Implement when spec is resolved
     }
 }
 

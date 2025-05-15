@@ -9,27 +9,26 @@
 //! on other parts of Servo.
 
 mod from_script_message;
-mod message_port;
+mod structured_data;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
 use base::Epoch;
 use base::cross_process_instant::CrossProcessInstant;
-use base::id::{PipelineId, WebViewId};
-use bitflags::bitflags;
+use base::id::{MessagePortId, PipelineId, WebViewId};
 use embedder_traits::{
-    CompositorHitTestResult, Cursor, InputEvent, MediaSessionActionType, Theme, ViewportDetails,
-    WebDriverCommandMsg,
+    CompositorHitTestResult, Cursor, InputEvent, JavaScriptEvaluationId, MediaSessionActionType,
+    Theme, ViewportDetails, WebDriverCommandMsg,
 };
 use euclid::Vector2D;
 pub use from_script_message::*;
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
-pub use message_port::*;
 use serde::{Deserialize, Serialize};
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
+pub use structured_data::*;
 use strum_macros::IntoStaticStr;
 use webrender_api::ExternalScrollId;
 use webrender_api::units::LayoutPixel;
@@ -57,8 +56,9 @@ pub enum EmbedderToConstellationMessage {
     ChangeViewportDetails(WebViewId, ViewportDetails, WindowSizeType),
     /// Inform the constellation of a theme change.
     ThemeChange(Theme),
-    /// Requests that the constellation instruct layout to begin a new tick of the animation.
-    TickAnimation(PipelineId, AnimationTickType),
+    /// Requests that the constellation instruct script/layout to try to layout again and tick
+    /// animations.
+    TickAnimation(Vec<WebViewId>),
     /// Dispatch a webdriver command
     WebDriverCommand(WebDriverCommandMsg),
     /// Reload a top-level browsing context.
@@ -92,6 +92,9 @@ pub enum EmbedderToConstellationMessage {
     SetScrollStates(PipelineId, Vec<ScrollState>),
     /// Notify the constellation that a particular paint metric event has happened for the given pipeline.
     PaintMetric(PipelineId, PaintMetricEvent),
+    /// Evaluate a JavaScript string in the context of a `WebView`. When execution is complete or an
+    /// error is encountered, a correpsonding message will be sent to the embedding layer.
+    EvaluateJavaScript(WebViewId, JavaScriptEvaluationId, String),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the
@@ -130,17 +133,6 @@ pub enum WindowSizeType {
     Resize,
 }
 
-bitflags! {
-    #[derive(Debug, Default, Deserialize, Serialize)]
-    /// Specifies if rAF should be triggered and/or CSS Animations and Transitions.
-    pub struct AnimationTickType: u8 {
-        /// Trigger a call to requestAnimationFrame.
-        const REQUEST_ANIMATION_FRAME = 0b001;
-        /// Trigger restyles for CSS Animations and Transitions.
-        const CSS_ANIMATIONS_AND_TRANSITIONS = 0b010;
-    }
-}
-
 /// The scroll state of a stacking context.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ScrollState {
@@ -157,4 +149,40 @@ pub enum TraversalDirection {
     Forward(usize),
     /// Travel backward the given number of documents.
     Back(usize),
+}
+
+/// A task on the <https://html.spec.whatwg.org/multipage/#port-message-queue>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct PortMessageTask {
+    /// The origin of this task.
+    pub origin: ImmutableOrigin,
+    /// A data-holder for serialized data and transferred objects.
+    pub data: StructuredSerializedData,
+}
+
+/// The information needed by a global to process the transfer of a port.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct PortTransferInfo {
+    /// <https://html.spec.whatwg.org/multipage/#port-message-queue>
+    pub port_message_queue: VecDeque<PortMessageTask>,
+    /// A boolean indicating whether the port has been disentangled while in transfer,
+    /// if so, the disentanglement should be completed along with the transfer.
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    pub disentangled: bool,
+}
+
+/// Messages for communication between the constellation and a global managing ports.
+#[derive(Debug, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum MessagePortMsg {
+    /// Complete the transfer for a batch of ports.
+    CompleteTransfer(HashMap<MessagePortId, PortTransferInfo>),
+    /// Complete the transfer of a single port,
+    /// whose transfer was pending because it had been requested
+    /// while a previous failed transfer was being rolled-back.
+    CompletePendingTransfer(MessagePortId, PortTransferInfo),
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    CompleteDisentanglement(MessagePortId),
+    /// Handle a new port-message-task.
+    NewTask(MessagePortId, PortMessageTask),
 }

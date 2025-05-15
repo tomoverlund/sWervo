@@ -20,15 +20,15 @@ use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    AnimationTickType, LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
+    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
     StructuredSerializedData, WindowSizeType,
 };
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    CompositorHitTestResult, InputEvent, MediaSessionActionType, Theme, ViewportDetails,
-    WebDriverScriptCommand,
+    CompositorHitTestResult, FocusSequenceNumber, InputEvent, JavaScriptEvaluationId,
+    MediaSessionActionType, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use euclid::{Rect, Scale, Size2D, UnknownUnit};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
@@ -47,8 +47,8 @@ use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::WebGPUMsg;
+use webrender_api::ImageKey;
 use webrender_api::units::DevicePixel;
-use webrender_api::{DocumentId, ImageKey};
 
 /// The initial data required to create a new layout attached to an existing script thread.
 #[derive(Debug, Deserialize, Serialize)]
@@ -191,11 +191,19 @@ pub enum ScriptThreadMessage {
     RemoveHistoryStates(PipelineId, Vec<HistoryStateId>),
     /// Set an iframe to be focused. Used when an element in an iframe gains focus.
     /// PipelineId is for the parent, BrowsingContextId is for the nested browsing context
-    FocusIFrame(PipelineId, BrowsingContextId),
+    FocusIFrame(PipelineId, BrowsingContextId, FocusSequenceNumber),
+    /// Focus the document. Used when the container gains focus.
+    FocusDocument(PipelineId, FocusSequenceNumber),
+    /// Notifies that the document's container (e.g., an iframe) is not included
+    /// in the top-level browsing context's focus chain (not considering system
+    /// focus) anymore.
+    ///
+    /// Obviously, this message is invalid for a top-level document.
+    Unfocus(PipelineId, FocusSequenceNumber),
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId, AnimationTickType),
+    TickAllAnimations(Vec<WebViewId>),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId, bool /* success */),
@@ -237,6 +245,9 @@ pub enum ScriptThreadMessage {
     /// The compositor scrolled and is updating the scroll states of the nodes in the given
     /// pipeline via the Constellation.
     SetScrollStates(PipelineId, Vec<ScrollState>),
+    /// Evaluate the given JavaScript and return a result via a corresponding message
+    /// to the Constellation.
+    EvaluateJavaScript(PipelineId, JavaScriptEvaluationId, String),
 }
 
 impl fmt::Debug for ScriptThreadMessage {
@@ -318,8 +329,6 @@ pub struct InitialScriptState {
     pub webgl_chan: Option<WebGLPipeline>,
     /// The XR device registry
     pub webxr_registry: Option<webxr_api::Registry>,
-    /// The Webrender document ID associated with this thread.
-    pub webrender_document: DocumentId,
     /// Access to the compositor across a process boundary.
     pub compositor_api: CrossProcessCompositorApi,
     /// Application window's GL Context for Media player

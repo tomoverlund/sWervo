@@ -25,7 +25,7 @@ use constellation_traits::{LoadData, SWManagerMsg, ScriptToConstellationChan};
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{DevtoolsControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::user_content_manager::UserContentManager;
-use embedder_traits::{AnimationState, ViewportDetails};
+use embedder_traits::{AnimationState, FocusSequenceNumber, ViewportDetails};
 use fonts::{SystemFontServiceProxy, SystemFontServiceProxySender};
 use ipc_channel::Error;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
@@ -47,7 +47,6 @@ use serde::{Deserialize, Serialize};
 use servo_config::opts::{self, Opts};
 use servo_config::prefs::{self, Preferences};
 use servo_url::ServoUrl;
-use webrender_api::DocumentId;
 
 use crate::event_loop::EventLoop;
 use crate::process_manager::Process;
@@ -103,6 +102,8 @@ pub struct Pipeline {
     /// The last compositor [`Epoch`] that was laid out in this pipeline if "exit after load" is
     /// enabled.
     pub layout_epoch: Epoch,
+
+    pub focus_sequence: FocusSequenceNumber,
 }
 
 /// Initial setup data needed to construct a pipeline.
@@ -183,9 +184,6 @@ pub struct InitialPipelineState {
     /// heavily limited rate. This field is only used to notify script and
     /// compositor threads after spawning a pipeline.
     pub prev_throttled: bool,
-
-    /// The ID of the document processed by this script thread.
-    pub webrender_document: DocumentId,
 
     /// A channel to the WebGL thread.
     pub webgl_chan: Option<WebGLPipeline>,
@@ -288,7 +286,6 @@ impl Pipeline {
                     opts: (*opts::get()).clone(),
                     prefs: Box::new(prefs::get().clone()),
                     pipeline_namespace_id: state.pipeline_namespace_id,
-                    webrender_document: state.webrender_document,
                     cross_process_compositor_api: state
                         .compositor_proxy
                         .cross_process_compositor_api
@@ -375,6 +372,7 @@ impl Pipeline {
             completely_loaded: false,
             title: String::new(),
             layout_epoch: Epoch(0),
+            focus_sequence: FocusSequenceNumber::default(),
         };
 
         pipeline.set_throttled(throttled);
@@ -503,7 +501,6 @@ pub struct UnprivilegedPipelineContent {
     prefs: Box<Preferences>,
     pipeline_namespace_id: PipelineNamespaceId,
     cross_process_compositor_api: CrossProcessCompositorApi,
-    webrender_document: DocumentId,
     webgl_chan: Option<WebGLPipeline>,
     webxr_registry: Option<webxr_api::Registry>,
     player_context: WindowGLContext,
@@ -551,7 +548,6 @@ impl UnprivilegedPipelineContent {
                 content_process_shutdown_sender: content_process_shutdown_chan,
                 webgl_chan: self.webgl_chan,
                 webxr_registry: self.webxr_registry,
-                webrender_document: self.webrender_document,
                 compositor_api: self.cross_process_compositor_api.clone(),
                 player_context: self.player_context.clone(),
                 inherited_secure_context: self.load_data.inherited_secure_context,

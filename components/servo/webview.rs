@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use base::id::WebViewId;
 use compositing::IOCompositor;
-use compositing_traits::RendererWebView;
+use compositing_traits::WebViewTrait;
 use constellation_traits::{EmbedderToConstellationMessage, TraversalDirection};
 use dpi::PhysicalSize;
 use embedder_traits::{
-    Cursor, InputEvent, LoadStatus, MediaSessionActionType, ScreenGeometry, Theme, TouchEventType,
-    ViewportDetails,
+    Cursor, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus, MediaSessionActionType,
+    ScreenGeometry, Theme, TouchEventType, ViewportDetails,
 };
 use euclid::{Point2D, Scale, Size2D};
 use servo_geometry::DeviceIndependentPixel;
@@ -23,6 +23,7 @@ use webrender_api::ScrollLocation;
 use webrender_api::units::{DeviceIntPoint, DevicePixel, DeviceRect};
 
 use crate::clipboard_delegate::{ClipboardDelegate, DefaultClipboardDelegate};
+use crate::javascript_evaluator::JavaScriptEvaluator;
 use crate::webview_delegate::{DefaultWebViewDelegate, WebViewDelegate};
 use crate::{ConstellationProxy, Servo, WebRenderDebugOption};
 
@@ -75,6 +76,7 @@ pub(crate) struct WebViewInner {
     pub(crate) compositor: Rc<RefCell<IOCompositor>>,
     pub(crate) delegate: Rc<dyn WebViewDelegate>,
     pub(crate) clipboard_delegate: Rc<dyn ClipboardDelegate>,
+    javascript_evaluator: Rc<RefCell<JavaScriptEvaluator>>,
 
     rect: DeviceRect,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
@@ -117,9 +119,10 @@ impl WebView {
             compositor: servo.compositor.clone(),
             delegate: builder.delegate,
             clipboard_delegate: Rc::new(DefaultClipboardDelegate),
+            javascript_evaluator: servo.javascript_evaluator.clone(),
             rect: DeviceRect::from_origin_and_size(Point2D::origin(), size),
             hidpi_scale_factor: builder.hidpi_scale_factor,
-            load_status: LoadStatus::Complete,
+            load_status: LoadStatus::Started,
             url: None,
             status_text: None,
             page_title: None,
@@ -549,6 +552,20 @@ impl WebView {
     pub fn paint(&self) -> bool {
         self.inner().compositor.borrow_mut().render()
     }
+
+    /// Evaluate the specified string of JavaScript code. Once execution is complete or an error
+    /// occurs, Servo will call `callback`.
+    pub fn evaluate_javascript<T: ToString>(
+        &self,
+        script: T,
+        callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static,
+    ) {
+        self.inner().javascript_evaluator.borrow_mut().evaluate(
+            self.id(),
+            script.to_string(),
+            Box::new(callback),
+        );
+    }
 }
 
 /// A structure used to expose a view of the [`WebView`] to the Servo
@@ -558,7 +575,7 @@ struct ServoRendererWebView {
     weak_handle: Weak<RefCell<WebViewInner>>,
 }
 
-impl RendererWebView for ServoRendererWebView {
+impl WebViewTrait for ServoRendererWebView {
     fn id(&self) -> WebViewId {
         self.id
     }

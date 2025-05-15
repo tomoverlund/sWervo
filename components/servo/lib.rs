@@ -18,6 +18,7 @@
 //! `WindowMethods` trait.
 
 mod clipboard_delegate;
+mod javascript_evaluator;
 mod proxies;
 mod responders;
 mod servo_delegate;
@@ -38,7 +39,6 @@ use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
-use canvas::WebGLComm;
 use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas_traits::webgl::{GlType, WebGLThreads};
 use clipboard_delegate::StringRequest;
@@ -83,7 +83,9 @@ pub use gleam::gl;
 use gleam::gl::RENDERER;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
+use javascript_evaluator::JavaScriptEvaluator;
 pub use keyboard_types::*;
+use layout::LayoutFactoryImpl;
 use log::{Log, Metadata, Record, debug, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::protocols::ProtocolRegistry;
@@ -98,6 +100,7 @@ use servo_delegate::DefaultServoDelegate;
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_url::ServoUrl;
+use webgl::WebGLComm;
 #[cfg(feature = "webgpu")]
 pub use webgpu;
 #[cfg(feature = "webgpu")]
@@ -109,9 +112,9 @@ use webview::WebViewInner;
 pub use webxr;
 pub use {
     background_hang_monitor, base, canvas, canvas_traits, devtools, devtools_traits, euclid, fonts,
-    ipc_channel, layout_thread_2020, media, net, net_traits, profile, profile_traits, script,
-    script_layout_interface, script_traits, servo_config as config, servo_config, servo_geometry,
-    servo_url, style, style_traits, webrender_api,
+    ipc_channel, media, net, net_traits, profile, profile_traits, script, script_layout_interface,
+    script_traits, servo_config as config, servo_config, servo_geometry, servo_url, style,
+    style_traits, webrender_api,
 };
 #[cfg(feature = "bluetooth")]
 pub use {bluetooth, bluetooth_traits};
@@ -119,6 +122,7 @@ pub use {bluetooth, bluetooth_traits};
 use crate::proxies::ConstellationProxy;
 use crate::responders::ServoErrorChannel;
 pub use crate::servo_delegate::{ServoDelegate, ServoError};
+use crate::webrender_api::FrameReadyParams;
 pub use crate::webview::{WebView, WebViewBuilder};
 pub use crate::webview_delegate::{
     AllowOrDenyRequest, AuthenticationRequest, FormControl, NavigationRequest, PermissionRequest,
@@ -194,6 +198,9 @@ pub struct Servo {
     compositor: Rc<RefCell<IOCompositor>>,
     constellation_proxy: ConstellationProxy,
     embedder_receiver: Receiver<EmbedderMsg>,
+    /// A struct that tracks ongoing JavaScript evaluations and is responsible for
+    /// calling the callback when the evaluation is complete.
+    javascript_evaluator: Rc<RefCell<JavaScriptEvaluator>>,
     /// Tracks whether we are in the process of shutting down, or have shut down.
     /// This is shared with `WebView`s and the `ServoRenderer`.
     shutdown_state: Rc<Cell<ShutdownState>>,
@@ -232,23 +239,19 @@ impl webrender_api::RenderNotifier for RenderNotifier {
     fn new_frame_ready(
         &self,
         document_id: DocumentId,
-        _scrolled: bool,
-        composite_needed: bool,
-        _frame_publish_id: FramePublishId,
+        _: FramePublishId,
+        frame_ready_params: &FrameReadyParams,
     ) {
         self.compositor_proxy
             .send(CompositorMsg::NewWebRenderFrameReady(
                 document_id,
-                composite_needed,
+                frame_ready_params.render,
             ));
     }
 }
 
 impl Servo {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip(builder), fields(servo_profiling = true), level = "trace",)
-    )]
+    #[servo_tracing::instrument(skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
         let opts = builder.opts.map(|opts| *opts);
@@ -489,10 +492,14 @@ impl Servo {
             opts.debug.convert_mouse_to_touch,
         );
 
+        let constellation_proxy = ConstellationProxy::new(constellation_chan);
         Self {
             delegate: RefCell::new(Rc::new(DefaultServoDelegate)),
             compositor: Rc::new(RefCell::new(compositor)),
-            constellation_proxy: ConstellationProxy::new(constellation_chan),
+            javascript_evaluator: Rc::new(RefCell::new(JavaScriptEvaluator::new(
+                constellation_proxy.clone(),
+            ))),
+            constellation_proxy,
             embedder_receiver,
             shutdown_state,
             webviews: Default::default(),
@@ -739,6 +746,11 @@ impl Servo {
                     );
                     webview.delegate().request_unload(webview, request);
                 }
+            },
+            EmbedderMsg::FinishJavaScriptEvaluation(evaluation_id, result) => {
+                self.javascript_evaluator
+                    .borrow_mut()
+                    .finish_evaluation(evaluation_id, result);
             },
             EmbedderMsg::Keyboard(webview_id, keyboard_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
@@ -1046,7 +1058,11 @@ fn create_constellation(
     );
 
     let system_font_service = Arc::new(
-        SystemFontService::spawn(compositor_proxy.cross_process_compositor_api.clone()).to_proxy(),
+        SystemFontService::spawn(
+            compositor_proxy.cross_process_compositor_api.clone(),
+            mem_profiler_chan.clone(),
+        )
+        .to_proxy(),
     );
 
     let (canvas_create_sender, canvas_ipc_sender) = CanvasPaintThread::start(
@@ -1079,7 +1095,7 @@ fn create_constellation(
         user_content_manager,
     };
 
-    let layout_factory = Arc::new(layout_thread_2020::LayoutFactoryImpl());
+    let layout_factory = Arc::new(LayoutFactoryImpl());
 
     Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start(
         initial_state,
@@ -1156,7 +1172,7 @@ pub fn run_content_process(token: String) {
             set_logger(content.script_to_constellation_chan().clone());
 
             let background_hang_monitor_register = content.register_with_background_hang_monitor();
-            let layout_factory = Arc::new(layout_thread_2020::LayoutFactoryImpl());
+            let layout_factory = Arc::new(LayoutFactoryImpl());
 
             content.register_system_memory_reporter();
 

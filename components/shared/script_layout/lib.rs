@@ -27,7 +27,7 @@ use fonts::{FontContext, SystemFontServiceProxy};
 use fxhash::FxHashMap;
 use ipc_channel::ipc::IpcSender;
 use libc::c_void;
-use malloc_size_of::MallocSizeOfOps;
+use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{ImageCache, PendingImageId};
 use pixels::Image;
@@ -51,7 +51,11 @@ use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::Stylesheet;
 use webrender_api::ImageKey;
 
-pub type GenericLayoutData = dyn Any + Send + Sync;
+pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub type GenericLayoutData = dyn GenericLayoutDataTrait + Send + Sync;
 
 #[derive(MallocSizeOf)]
 pub struct StyleData {
@@ -59,7 +63,6 @@ pub struct StyleData {
     /// style system is being used standalone, this is all that hangs
     /// off the node. This must be first to permit the various
     /// transmutations between ElementData and PersistentLayoutData.
-    #[ignore_malloc_size_of = "This probably should not be ignored"]
     pub element_data: AtomicRefCell<ElementData>,
 
     /// Information needed during parallel traversals.
@@ -111,19 +114,12 @@ pub enum LayoutElementType {
     HTMLTableRowElement,
     HTMLTableSectionElement,
     HTMLTextAreaElement,
+    SVGImageElement,
     SVGSVGElement,
 }
 
-pub enum HTMLCanvasDataSource {
-    WebGL(ImageKey),
-    Image(ImageKey),
-    WebGPU(ImageKey),
-    /// transparent black
-    Empty,
-}
-
 pub struct HTMLCanvasData {
-    pub source: HTMLCanvasDataSource,
+    pub source: Option<ImageKey>,
     pub width: u32,
     pub height: u32,
 }
@@ -240,16 +236,16 @@ pub trait Layout {
     /// Set the scroll states of this layout after a compositor scroll.
     fn set_scroll_offsets(&mut self, scroll_states: &[ScrollState]);
 
-    fn query_content_box(&self, node: OpaqueNode) -> Option<Rect<Au>>;
-    fn query_content_boxes(&self, node: OpaqueNode) -> Vec<Rect<Au>>;
-    fn query_client_rect(&self, node: OpaqueNode) -> Rect<i32>;
+    fn query_content_box(&self, node: TrustedNodeAddress) -> Option<Rect<Au>>;
+    fn query_content_boxes(&self, node: TrustedNodeAddress) -> Vec<Rect<Au>>;
+    fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32>;
     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_nodes_from_point(
         &self,
         point: Point2D<f32>,
         query_type: NodesFromPointQueryType,
     ) -> Vec<UntrustedNodeAddress>;
-    fn query_offset_parent(&self, node: OpaqueNode) -> OffsetParentResponse;
+    fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse;
     fn query_resolved_style(
         &self,
         node: TrustedNodeAddress,
@@ -265,7 +261,7 @@ pub trait Layout {
         animations: DocumentAnimationSet,
         animation_timeline_value: f64,
     ) -> Option<ServoArc<Font>>;
-    fn query_scrolling_area(&self, node: Option<OpaqueNode>) -> Rect<i32>;
+    fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32>;
     fn query_text_indext(&self, node: OpaqueNode, point: Point2D<f32>) -> Option<usize>;
 }
 
@@ -433,6 +429,8 @@ pub struct ReflowRequest {
     pub node_to_image_animation_map: FxHashMap<OpaqueNode, ImageAnimationState>,
     /// The theme for the window
     pub theme: PrefersColorScheme,
+    /// The node highlighted by the devtools, if any
+    pub highlighted_dom_node: Option<OpaqueNode>,
 }
 
 /// A pending restyle.
