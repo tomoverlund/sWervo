@@ -201,9 +201,10 @@ impl MediaFrameRenderer {
 impl VideoFrameRenderer for MediaFrameRenderer {
     fn render(&mut self, frame: VideoFrame) {
         // Don't render new frames if the poster should be shown
-        if self.show_poster {
-            return;
-        }
+        // TODO: Commenting out to see if it helps.
+        // if self.show_poster {
+        //     return;
+        // }
 
         let mut updates = vec![];
 
@@ -334,6 +335,9 @@ impl From<MediaStreamOrBlob> for SrcObject {
 #[allow(non_snake_case)]
 pub(crate) struct HTMLMediaElement {
     htmlelement: HTMLElement,
+    // TODO: Stick this somewhere else? Use the servo_media player object directly?
+    /// Non-HTML. Stores the playback state from the backend (servo_media).
+    playback_state: Cell<PlaybackStateWrapper>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-networkstate>
     network_state: Cell<NetworkState>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-readystate>
@@ -423,6 +427,27 @@ pub(crate) struct HTMLMediaElement {
     player_context: WindowGLContext,
 }
 
+#[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub(crate) enum PlaybackStateWrapper {
+    Stopped = PlaybackState::Stopped as u8,
+    Buffering = PlaybackState::Buffering as u8,
+    Paused = PlaybackState::Paused as u8,
+    Playing = PlaybackState::Playing as u8,
+}
+
+impl PlaybackStateWrapper {
+    fn wrap(value: PlaybackState) -> PlaybackStateWrapper {
+        match value {
+            PlaybackState::Stopped => PlaybackStateWrapper::Stopped,
+            PlaybackState::Buffering => PlaybackStateWrapper::Buffering,
+            PlaybackState::Paused => PlaybackStateWrapper::Paused,
+            PlaybackState::Playing => PlaybackStateWrapper::Playing,
+        }
+    }
+}
+
+
 /// <https://html.spec.whatwg.org/multipage/#dom-media-networkstate>
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 #[repr(u8)]
@@ -453,6 +478,7 @@ impl HTMLMediaElement {
     ) -> Self {
         Self {
             htmlelement: HTMLElement::new_inherited(tag_name, prefix, document),
+            playback_state: Cell::new(PlaybackStateWrapper::wrap(PlaybackState::Stopped)),
             network_state: Cell::new(NetworkState::Empty),
             ready_state: Cell::new(ReadyState::HaveNothing),
             src_object: Default::default(),
@@ -695,7 +721,10 @@ impl HTMLMediaElement {
             // FIXME(nox): I have no idea what this TODO is about.
 
             // FIXME(nox): Review this block.
-            if self.autoplaying.get() && self.Paused() && self.Autoplay() {
+            // TODO: self.Autoplay() always returns false? No code sets this
+            // as far as I can see. Removed from if-clause for now.
+            //if self.autoplaying.get() && self.Paused() && self.Autoplay() {
+            if self.autoplaying.get() && self.Paused() {
                 // Step 1
                 self.paused.set(false);
                 // Step 2
@@ -1820,6 +1849,17 @@ impl HTMLMediaElement {
                         .clone()
                         .unwrap_or(window.get_url().into_string()),
                 );
+
+                // If the metadata came after StateChanged(Paused).
+                // Make sure we actually have a duration if the event isn't live and is seekable.
+                if self.playback_state.get() >= PlaybackStateWrapper::Paused {
+                    let have_enough: bool = metadata.is_live
+                        || !metadata.is_seekable
+                        || self.duration.get() < f64::INFINITY;
+                    if have_enough {
+                        self.change_ready_state(ReadyState::HaveEnoughData);
+                    }
+                }
             },
             PlayerEvent::NeedData => {
                 // The player needs more data.
@@ -1892,18 +1932,52 @@ impl HTMLMediaElement {
                 let mut media_session_playback_state = MediaSessionPlaybackState::None_;
                 match *state {
                     PlaybackState::Paused => {
+                        self.playback_state.set(PlaybackStateWrapper::wrap(PlaybackState::Paused));
                         media_session_playback_state = MediaSessionPlaybackState::Paused;
                         if self.ready_state.get() == ReadyState::HaveMetadata {
                             self.change_ready_state(ReadyState::HaveEnoughData);
                         }
                     },
                     PlaybackState::Playing => {
+                        self.playback_state.set(PlaybackStateWrapper::wrap(PlaybackState::Playing));
                         media_session_playback_state = MediaSessionPlaybackState::Playing;
                     },
                     PlaybackState::Buffering => {
+                        self.playback_state.set(PlaybackStateWrapper::wrap(PlaybackState::Buffering));
                         // Do not send the media session playback state change event
                         // in this case as a None_ state is expected to clean up the
                         // session.
+
+                        // TODO: This needs to be handled, as GstPlay (via
+                        // Playbin) can go into the buffering state during
+                        // playback if it runs out of data in its buffer.
+                        //
+                        // See: https://gstreamer.freedesktop.org/documentation/playback/playbin.html?gi-language=c#buffering
+
+                        // TODO: "media_session_event":
+                        // ./components/constellation/constellation.rs:
+                        //   if let MediaSessionEvent::PlaybackStateChange(ref state) = event {
+                        //
+                        // * Nothing corresponds to Buffering here. Closest is
+                        //   Paused, but it can't technically be resumed. It
+                        //   could be None_, except the above comment implies
+                        //   the session would be closed, which we do not want
+                        //   for buffering.
+                        //
+                        //   In terms of the HTML spec (media.readyState),
+                        //   Buffering corresponds to any state below
+                        //   HAVE_ENOUGH_DATA: HAVE_NOTHING, HAVE_METADATA,
+                        //   HAVE_CURRENT_DATA, or HAVE_FUTURE_DATA.
+                        //
+                        // ./components/shared/embedder/lib.rs:
+                        //   pub enum MediaSessionPlaybackState {
+                        //       /// The browsing context does not specify whether it’s playing or paused.
+                        //       None_ = 1,
+                        //       /// The browsing context is currently playing media and it can be paused.
+                        //       Playing,
+                        //       /// The browsing context has paused media and it can be resumed.
+                        //       Paused,
+                        //   }
                         return;
                     },
                     _ => {},
